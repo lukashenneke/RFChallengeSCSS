@@ -5,6 +5,20 @@ import matplotlib.pyplot as plt
 all_sinr = np.arange(-30, 0.1, 3)
 n_per_batch = 100
 SAVE = False
+model_id = [
+    'none', 
+    'wavenet', 
+    'wave-sae', 'wave-sae_ft', 
+    'wave-sae_sinr', 'wave-sae_sinr_ft', 
+    'wave-sae_16bs', 'wave-sae_16bs_ft', 
+    'wave-sae_wo_enc_sc', 'wave-sae_wo_enc_sc_ft', 
+    'wave-sae_wo_encdec_sc', 'wave-sae_wo_encdec_sc_ft', 
+    'wave-sae_wo_encdec_sc_16bs', 'wave-sae_wo_encdec_sc_16bs_ft', 
+    'wave-sae_harddec', 'wave-sae_harddec_ft',
+    'wave-sae_lam', 'wave-sae_lam_ft',
+    'wave-sae_mse', 'wave-sae_mse_ft', 
+    'wave-sae_fo', 'wave-sae_fo_ft', 
+]
 
 def run_evaluation(testset_identifier, soi_identifier, interference_identifier):
     keep_scores = {}
@@ -13,19 +27,7 @@ def run_evaluation(testset_identifier, soi_identifier, interference_identifier):
     for soi_type in soi_identifier:
         for interference_sig_type in interference_identifier:
             all_mse, all_ber, all_scores = {}, {}, {}
-            for id_string in [
-                'none', 'wavenet', 
-                'wave-sae', 'wave-sae_ft', 
-                'wave-sae_sinr', 'wave-sae_sinr_ft', 
-                'wave-sae_16bs', 'wave-sae_16bs_ft', 
-                'wave-sae_wo_enc_sc', 'wave-sae_wo_enc_sc_ft', 
-                'wave-sae_wo_encdec_sc', 'wave-sae_wo_encdec_sc_ft', 
-                'wave-sae_wo_encdec_sc_16bs', 'wave-sae_wo_encdec_sc_16bs_ft', 
-                'wave-sae_harddec', 'wave-sae_harddec_ft',
-                'wave-sae_lam', 'wave-sae_lam_ft',
-                'wave-sae_mse', 'wave-sae_mse_ft', 
-                'wave-sae_fo', 'wave-sae_fo_ft', 
-                ]:
+            for id_string in model_id:
                 try:
                     results = np.load(os.path.join('outputs', f'{id_string}_{testset_identifier}_{soi_type}_{interference_sig_type}_results.npy'))
                 except FileNotFoundError:
