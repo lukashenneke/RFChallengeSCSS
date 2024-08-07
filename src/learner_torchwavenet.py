@@ -17,45 +17,30 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
+import h5py
 
 from dataclasses import asdict
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from typing import Dict
 
 from .config_torchwavenet import Config
-from .torchdataset import RFMixtureDatasetBase, get_train_val_dataset
+from .dataset import MixtureDataset
 from .torchwavenet import Wave
+from .soi_autoencoder import WaveQPSK, WaveOFDM
+from .loss import MSE_BCE_loss, MSE_MSE_loss
 
-
-def _nested_map(struct, map_fn):
-    if isinstance(struct, tuple):
-        return tuple(_nested_map(x, map_fn) for x in struct)
-    if isinstance(struct, list):
-        return [_nested_map(x, map_fn) for x in struct]
-    if isinstance(struct, dict):
-        return {k: _nested_map(v, map_fn) for k, v in struct.items()}
-    return map_fn(struct)
-
-
-def view_as_complex(x): 
-    x = x[:, 0, ...] + 1j * x[:, 1, ...]
-    return x
-
+_map = lambda x: torch.view_as_real(x).transpose(-2,-1)
 
 class WaveLearner:
-    def __init__(self, cfg: Config, model: nn.Module, rank: int):
+    def __init__(self, cfg: Config, model: nn.Module, gen):
         self.cfg = cfg
+        self.gen = gen
 
         # Store some import variables
         self.model_dir = cfg.model_dir
-        self.distributed = cfg.distributed.distributed
-        self.world_size = cfg.distributed.world_size
-        self.rank = rank
         self.log_every = cfg.trainer.log_every
         self.validate_every = cfg.trainer.validate_every
         self.save_every = cfg.trainer.save_every
@@ -63,49 +48,51 @@ class WaveLearner:
         self.build_dataloaders()
 
         self.model = model
+        params = [self.model] if not cfg.trainer.fix_wavenet_params else [self.model.encoder, self.model.scale, self.model.decoder]
         self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=cfg.trainer.learning_rate)
-        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, "min",
-        )
+            (p for m in params for p in m.parameters()), lr=cfg.trainer.learning_rate)
+        if len(cfg.trainer.lr_milestones) == 0:
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, "min",)
+        else:
+            self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, cfg.trainer.lr_milestones, gamma=0.1, last_epoch=-1)
         self.autocast = torch.cuda.amp.autocast(enabled=cfg.trainer.fp16)
         self.scaler = torch.cuda.amp.GradScaler(enabled=cfg.trainer.fp16)
         self.step = 0
 
-        self.loss_fn = nn.MSELoss()
+        if cfg.trainer.loss_fun == 'MSE':
+            self.loss_fn = nn.MSELoss()
+        elif cfg.trainer.loss_fun == 'MSE+BCE':
+            self.loss_fn = MSE_BCE_loss(cfg.trainer.lambda_mse, cfg.trainer.lambda_ber)
+        elif cfg.trainer.loss_fun == 'MSE+MSE':
+            self.loss_fn = MSE_MSE_loss(cfg.trainer.lambda_mse, cfg.trainer.lambda_ber)
         self.writer = SummaryWriter(self.model_dir)
 
-    @property
-    def is_master(self):
-        return self.rank == 0
-
     def build_dataloaders(self):
-        self.dataset = RFMixtureDatasetBase(
-            root_dir=self.cfg.data.root_dir,
+        bits = not (self.cfg.trainer.loss_fun == 'MSE')
+        cdt = self.cfg.data
+        with h5py.File(self.cfg.data.data_dir,'r') as data_h5file:
+            sig_data = np.array(data_h5file.get('dataset'))
+        with h5py.File(self.cfg.data.val_data_dir,'r') as data_h5file:
+            valid_data = np.array(data_h5file.get('dataset'))
+        self.train_dataset = MixtureDataset(
+            self.gen, sig_data, cdt.sig_len, cdt.batch_size*1000, cdt.sinr_range, cdt.fo_std, return_bits=bits, fix=False
         )
-        self.train_dataset, self.val_dataset = get_train_val_dataset(
-            self.dataset, self.cfg.data.train_fraction)
+        self.val_dataset = MixtureDataset(
+            self.gen, valid_data, cdt.sig_len, cdt.batch_size*64, cdt.sinr_range, cdt.fo_std, return_bits=bits, fix=True
+        )
 
         self.train_dataloader = DataLoader(
             self.train_dataset,
-            batch_size=self.cfg.data.batch_size,
-            shuffle=not self.distributed,
-            num_workers=self.cfg.data.num_workers if self.distributed else 0,
-            sampler=DistributedSampler(
-                self.train_dataset,
-                num_replicas=self.world_size,
-                rank=self.rank) if self.distributed else None,
+            batch_size=cdt.batch_size,
+            shuffle=False,
+            num_workers=cdt.num_workers,
             pin_memory=True,
         )
         self.val_dataloader = DataLoader(
             self.val_dataset,
-            batch_size=self.cfg.data.batch_size * 4,
-            shuffle=not self.distributed,
-            num_workers=self.cfg.data.num_workers if self.distributed else 0,
-            sampler=DistributedSampler(
-                self.val_dataset,
-                num_replicas=self.world_size,
-                rank=self.rank) if self.distributed else None,
+            batch_size=cdt.batch_size * 4,
+            shuffle=False,
+            num_workers=cdt.num_workers,
             pin_memory=True,
         )
 
@@ -132,6 +119,10 @@ class WaveLearner:
         self.optimizer.load_state_dict(state_dict['optimizer'])
         self.scaler.load_state_dict(state_dict['scaler'])
         self.step = state_dict['step']
+        if len(self.cfg.trainer.lr_milestones) > 0:
+            self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                self.optimizer, self.cfg.trainer.lr_milestones, gamma=0.1, last_epoch=self.step-1
+            )
 
     def save_to_checkpoint(self, filename='weights'):
         save_basename = f'{filename}-{self.step}.pt'
@@ -152,14 +143,17 @@ class WaveLearner:
             return False
 
     def train(self):
-        device = next(self.model.parameters()).device
 
         while True:
-            for i, features in enumerate(
-                tqdm(self.train_dataloader, 
-                     desc=f"Training ({self.step} / {self.max_steps})")):
-                features = _nested_map(features, lambda x: x.to(
-                    device) if isinstance(x, torch.Tensor) else x)
+            for features in tqdm(
+                self.train_dataloader, 
+                desc=f"Training ({self.step} / {self.max_steps})"
+            ):
+                if self.step >= self.max_steps:
+                    self.save_to_checkpoint()
+                    print("Ending training...")
+                    exit(0)
+
                 loss = self.train_step(features)
 
                 # Check for NaNs
@@ -167,43 +161,39 @@ class WaveLearner:
                     raise RuntimeError(
                         f'Detected NaN loss at step {self.step}.')
 
-                if self.is_master:
-                    if self.step % self.log_every == 0:
-                        self.writer.add_scalar('train/loss', loss, self.step)
-                        self.writer.add_scalar(
-                            'train/grad_norm', self.grad_norm, self.step)
-                    if self.step % self.save_every == 0:
-                        self.save_to_checkpoint()
+                if self.step % self.log_every == 0:
+                    self.writer.add_scalar('train/loss', loss, self.step)
+                    if hasattr(self.loss_fn, 'tmp_ber'):
+                        self.writer.add_scalar('train/loss_mse', self.loss_fn.tmp_mse, self.step)
+                        self.writer.add_scalar('train/loss_ber', self.loss_fn.tmp_ber, self.step)
+                    self.writer.add_scalar('train/grad_norm', self.grad_norm, self.step)
+                    self.writer.add_scalar('train/learning_rate', self.optimizer.param_groups[0]["lr"], self.step)
+                if self.step % self.save_every == 0:
+                    self.save_to_checkpoint()
 
                 if self.step % self.validate_every == 0:
                     val_loss = self.validate()
                     # Update the learning rate if it plateus
-                    self.lr_scheduler.step(val_loss)
+                    if len(self.cfg.trainer.lr_milestones) == 0:
+                        self.lr_scheduler.step(val_loss)
 
-                if self.distributed:
-                    dist.barrier()
+                if len(self.cfg.trainer.lr_milestones) > 0:
+                    self.lr_scheduler.step()
 
                 self.step += 1
 
-                if self.step == self.max_steps:
-                    if self.is_master and self.distributed:
-                        self.save_to_checkpoint()
-                        print("Ending training...")
-                    dist.barrier()
-                    exit(0)
-
-    def train_step(self, features: Dict[str, torch.Tensor]):
+    def train_step(self, features: tuple):
+        device = next(self.model.parameters()).device
         for param in self.model.parameters():
             param.grad = None
 
-        sample_mix = features["sample_mix"]
-        sample_soi = features["sample_soi"]
-
-        N, _, _ = sample_mix.shape
+        sample_mix = _map(features[0]).to(device)
+        target = _map(features[1]).to(device)
+        if len(features) > 2: target = (target, features[2].to(device))
 
         with self.autocast:
             predicted = self.model(sample_mix)
-            loss = self.loss_fn(predicted, sample_soi)
+            loss = self.loss_fn(predicted, target)
 
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -224,53 +214,42 @@ class WaveLearner:
             self.val_dataloader, 
             desc=f"Running validation after step {self.step}"
         ):
-            features = _nested_map(features, lambda x: x.to(
-                device) if isinstance(x, torch.Tensor) else x)
-            sample_mix = features["sample_mix"]
-            sample_soi = features["sample_soi"]
-            N, _, _ = sample_mix.shape
+            sample_mix = _map(features[0]).to(device)
+            target = _map(features[1]).to(device)
+            if len(features) > 2: target = (target, features[2].to(device))
 
             with self.autocast:
                 predicted = self.model(sample_mix)
-                loss += torch.sum(
-                    (predicted - sample_soi) ** 2, (0, 1, 2)
-                ) / len(self.val_dataset) / np.prod(sample_soi.shape[1:])
-        if self.distributed:
-            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                loss +=  self.loss_fn(predicted, target) * sample_mix.shape[0] / len(self.val_dataset)
 
         self.writer.add_scalar('val/loss', loss, self.step)
         self.model.train()
 
         return loss
+    
 
-
-def _train_impl(rank: int, model: nn.Module, cfg: Config):
+def train(cfg: Config, gen):
+    """Training on a single GPU."""
     torch.backends.cudnn.benchmark = True
 
-    learner = WaveLearner(cfg, model, rank)
+    model = Wave(cfg.model).cuda()
+    print('Params:', sum(p.numel() for p in model.parameters()))
+
+    learner = WaveLearner(cfg, model, gen)
     learner.restore_from_checkpoint()
     learner.train()
 
+def train_sae(cfg: Config, gen):
+    torch.backends.cudnn.benchmark = True
 
-def train(cfg: Config):
-    """Training on a single GPU."""
-    model = Wave(cfg.model).cuda()
-    _train_impl(0, model, cfg)
+    if gen.soi_type == 'QPSK':
+        model = WaveQPSK(cfg.model, cfg.sae).cuda()
+    elif gen.soi_type == 'OFDMQPSK':
+        model = WaveOFDM(cfg.model, cfg.sae).cuda()
+    if cfg.pretrained is not None:
+        res = model.load_state_dict(torch.load(cfg.pretrained)['model'], strict=False)
+    print('Params:', sum(p.numel() for p in model.parameters()))
 
-
-def init_distributed(rank: int, world_size: int, port: str):
-    """Initialize distributed training on multiple GPUs."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(port)
-    torch.distributed.init_process_group(
-        'nccl', rank=rank, world_size=world_size)
-
-
-def train_distributed(rank: int, world_size: int, port, cfg: Config):
-    """Training on multiple GPUs."""
-    init_distributed(rank, world_size, port)
-    device = torch.device('cuda', rank)
-    torch.cuda.set_device(device)
-    model = Wave(cfg.model).to(device)
-    model = DistributedDataParallel(model, device_ids=[rank])
-    _train_impl(rank, model, cfg)
+    learner = WaveLearner(cfg, model, gen)
+    learner.restore_from_checkpoint()
+    learner.train()

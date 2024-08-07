@@ -1,9 +1,10 @@
 import os, sys
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+import torch
 import numpy as np
 import random
 import h5py
 from tqdm import tqdm
-import pickle
 
 import rfcutils
 import tensorflow as tf
@@ -76,18 +77,27 @@ def generate_demod_testmixture(soi_type, interference_sig_type):
         all_bits1.append(bits1)
 
         actual_sinr = get_sinr_db(sig_target, sig_interference * coeff)
-        meta_data.append(np.vstack(([rand_gain.numpy().real for _ in range(n_per_batch)], [sinr for _ in range(n_per_batch)], actual_sinr, [soi_type for _ in range(n_per_batch)], [interference_sig_type for _ in range(n_per_batch)])))
+        meta_data.append(np.vstack(([rand_gain.numpy().real for _ in range(n_per_batch)], [sinr for _ in range(n_per_batch)], actual_sinr)))
 
     with tf.device('CPU'):
         all_sig_mixture = tf.concat(all_sig_mixture, axis=0).numpy()
         all_sig1 = tf.concat(all_sig1, axis=0).numpy()
         all_bits1 = tf.concat(all_bits1, axis=0).numpy()
 
-    pickle.dump((all_sig_mixture, all_sig1, all_bits1), open(os.path.join('dataset', f'GroundTruth_TestSet1Example_Dataset_{soi_type}_{interference_sig_type}.pkl'), 'wb'), protocol=4)
-    np.save(os.path.join('dataset', f'TestSet1Example_testmixture_{soi_type}_{interference_sig_type}'), all_sig_mixture)
-
+    # changed saving mode --> hdf5
     meta_data = np.concatenate(meta_data, axis=1).T
-    np.save(os.path.join('dataset', f'TestSet1Example_testmixture_{soi_type}_{interference_sig_type}_metadata'), meta_data)
+    
+    with h5py.File(os.path.join('dataset', f'TestSet1Example_Dataset_{soi_type}_{interference_sig_type}.h5'), 'w') as hf:
+        hf.create_dataset('soi_type', data=soi_type.encode('UTF-8'))
+        hf.create_dataset('interference_sig_type', data=interference_sig_type.encode('UTF-8'))
+        hf.create_dataset('mixtures', data=all_sig_mixture)
+        hf.create_dataset('soi', data=all_sig1)
+        hf.create_dataset('bits', data=all_bits1)
+        hf.create_dataset('meta_data', data=meta_data)
 
 if __name__ == "__main__":
-    generate_demod_testmixture(sys.argv[1], sys.argv[2])
+    soi = [sys.argv[1]] if len(sys.argv) > 1 else ['QPSK', 'OFDMQPSK']
+    interference = [sys.argv[2]] if len(sys.argv) > 2 else ['EMISignal1', 'CommSignal2', 'CommSignal3', 'CommSignal5G1']
+    for s in soi:
+        for i in interference:
+            generate_demod_testmixture(s,i)

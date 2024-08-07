@@ -1,6 +1,6 @@
-from dataclasses import MISSING, asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -15,28 +15,38 @@ class ModelConfig:
     residual_channels: int = 64
     dilation_cycle_length: int = 10
 
+@dataclass
+class SAEConfig:
+    sigmoid: bool = True
+    hard_dec: bool = False
+    encoder_scaling: bool = True
+    decoder_scaling: bool = True
 
 @dataclass
 class DataConfig:
-    root_dir: str = MISSING
+    data_dir: str = MISSING
+    val_data_dir: str = MISSING
+    sig_len: int = 40960
+    sinr_range: List[int] = field(default_factory=lambda: [-30, 0])
+    fo_std: float = 0
     batch_size: int = 16
-    num_workers: int = 4
-    train_fraction: float = 0.8
-
-
-@dataclass
-class DistributedConfig:
-    distributed: bool = False
-    world_size: int = 2
+    num_workers: int = 2
 
 
 @dataclass
 class TrainerConfig:
+    fix_wavenet_params: bool = False
     learning_rate: float = 2e-4
+    lr_milestones: List[int] = field(default_factory=lambda: [])
+
     max_steps: int = 1000
     max_grad_norm: Optional[float] = None
     fp16: bool = False
 
+    loss_fun: str = 'MSE' # 'MSE', 'MSE+BCE', 'MSE+MSE
+    lambda_mse: float = 1.0
+    lambda_ber: float = 1.0
+    
     log_every: int = 50
     save_every: int = 2000
     validate_every: int = 100
@@ -45,10 +55,11 @@ class TrainerConfig:
 @dataclass
 class Config:
     model_dir: str = MISSING
+    pretrained: Optional[str] = None
 
     model: ModelConfig = ModelConfig()
-    data: DataConfig = DataConfig(root_dir="")
-    distributed: DistributedConfig = DistributedConfig()
+    sae: SAEConfig = SAEConfig()
+    data: DataConfig = DataConfig(data_dir="", val_data_dir="")
     trainer: TrainerConfig = TrainerConfig()
 
 
