@@ -1,0 +1,26 @@
+model_dir: ${datetime:"checkpoints/wavenet"}
+model:
+  residual_layers: 30
+  residual_channels: 128
+  dilation_cycle_length: 10
+sae:
+  encoder_scaling: False
+  decoder_scaling: False
+data:
+  data_dir: dataset
+  batch_size: 16
+  num_workers: 2
+  sinr_range: [-30, 3]
+  fo_std: 0
+trainer:
+  fix_wavenet_params: True
+  learning_rate: 1e-3
+  lr_milestones: [5000, 10000, 15000, 22500]
+  max_steps: 25_000
+  loss_fun: 'MSE+BCE'
+  lambda_mse: 1.0
+  lambda_ber: 1.0
+  fp16: True
+  log_every: 50
+  save_every: 5000
+  validate_every: 500
